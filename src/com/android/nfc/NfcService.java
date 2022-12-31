@@ -144,6 +144,7 @@ import java.lang.reflect.Method;
 import java.lang.reflect.InvocationTargetException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
+import java.security.SecureRandom;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.Arrays;
 import java.util.ArrayList;
@@ -419,8 +420,10 @@ public class NfcService implements DeviceHostListener {
             new ReaderModeDeathRecipient();
     private final NfcUnlockManager mNfcUnlockManager;
 
-
     private final BackupManager mBackupManager;
+
+    private final SecureRandom mCookieGenerator = new SecureRandom();
+
     // cached version of installed packages requesting Android.permission.NFC_TRANSACTION_EVENTS
     // for current user and profiles. The Integer part is the userId.
     HashMap<Integer, List<String>> mNfcEventInstalledPackages =
@@ -447,7 +450,6 @@ public class NfcService implements DeviceHostListener {
 
     private int mUserId;
     boolean mPollingPaused;
-    boolean mPollingDelayed;
     boolean mNfcStateCheck = true;
     // True if nfc notification message already shown
     boolean mAntennaBlockedMessageShown;
@@ -507,12 +509,18 @@ public class NfcService implements DeviceHostListener {
     boolean mIsRequestUnlockShowed;
     boolean mIsRecovering;
 
-    int mPollDelay;
+    // polling delay control variables
+    private final int mPollDelayTime;
+    private final int mPollDelayTimeLong;
+    private final int mPollDelayCountMax;
+    private int mPollDelayCount;
+    private boolean mPollDelayed;
+
     boolean mNotifyDispatchFailed;
     boolean mNotifyReadFailed;
 
     // for recording the latest Tag object cookie
-    long mCookieUpToDate = 0;
+    long mCookieUpToDate = -1;
 
     private NfcDispatcher mNfcDispatcher;
     private PowerManager mPowerManager;
@@ -927,8 +935,14 @@ public class NfcService implements DeviceHostListener {
             mAntennaBlockedMessageShown = true;
         }
 
-        // Polling delay variables
-        mPollDelay = mContext.getResources().getInteger(R.integer.unknown_tag_polling_delay);
+        // Polling delay count for switching from stage one to stage two.
+        mPollDelayCountMax =
+                mContext.getResources().getInteger(R.integer.unknown_tag_polling_delay_count_max);
+        // Stage one: polling delay time for the first few unknown tag detections
+        mPollDelayTime = mContext.getResources().getInteger(R.integer.unknown_tag_polling_delay);
+        // Stage two: longer polling delay time after max_poll_delay_count
+        mPollDelayTimeLong =
+                mContext.getResources().getInteger(R.integer.unknown_tag_polling_delay_long);
         mNotifyDispatchFailed =
             mContext.getResources().getBoolean(R.bool.enable_notify_dispatch_failed);
         mNotifyReadFailed = mContext.getResources().getBoolean(R.bool.enable_notify_read_failed);
@@ -1297,7 +1311,8 @@ public class NfcService implements DeviceHostListener {
             }
 
             // Disable delay polling when disabling
-            mPollingDelayed = false;
+            mPollDelayed = false;
+            mPollDelayCount = 0;
             mHandler.removeMessages(MSG_DELAY_POLLING);
 
             // Stop watchdog if tag present
@@ -2965,8 +2980,10 @@ public class NfcService implements DeviceHostListener {
                 tag.findAndReadNdef();
                 // Build a new Tag object to return
                 try {
+                    /* Avoid setting mCookieUpToDate to negative values */
+                    mCookieUpToDate = mCookieGenerator.nextLong() >>> 1;
                     Tag newTag = new Tag(tag.getUid(), tag.getTechList(),
-                            tag.getTechExtras(), tag.getHandle(), this);
+                            tag.getTechExtras(), tag.getHandle(), mCookieUpToDate, this);
                     return newTag;
                 } catch (Exception e) {
                     Log.e(TAG, "Tag creation exception.", e);
@@ -3017,14 +3034,8 @@ public class NfcService implements DeviceHostListener {
         }
 
         @Override
-        public void setTagUpToDate(long cookie) throws RemoteException {
-            if (DBG) Log.d(TAG, "Register Tag " + Long.toString(cookie) + " as the latest");
-            mCookieUpToDate = cookie;
-        }
-
-        @Override
         public boolean isTagUpToDate(long cookie) throws RemoteException {
-            if (mCookieUpToDate == cookie) {
+            if (mCookieUpToDate != -1 && mCookieUpToDate == cookie) {
                 if (DBG) Log.d(TAG, "Tag " + Long.toString(cookie) + " is up to date");
                 return true;
             }
@@ -3837,9 +3848,11 @@ public class NfcService implements DeviceHostListener {
                     extras.putInt(Ndef.EXTRA_NDEF_MAXLENGTH, 0);
                     extras.putInt(Ndef.EXTRA_NDEF_CARDSTATE, Ndef.NDEF_MODE_READ_ONLY);
                     extras.putInt(Ndef.EXTRA_NDEF_TYPE, Ndef.TYPE_OTHER);
+                    /* Avoid setting mCookieUpToDate to negative values */
+                    mCookieUpToDate = mCookieGenerator.nextLong() >>> 1;
                     Tag tag = Tag.createMockTag(new byte[]{0x00},
                             new int[]{TagTechnology.NDEF},
-                            new Bundle[]{extras});
+                            new Bundle[]{extras}, mCookieUpToDate);
                     Log.d(TAG, "mock NDEF tag, starting corresponding activity");
                     Log.d(TAG, tag.toString());
                     int dispatchStatus = mNfcDispatcher.dispatchTag(tag);
@@ -3870,6 +3883,7 @@ public class NfcService implements DeviceHostListener {
                                 @Override
                                 public void onTagDisconnected(long handle) {
                                     if((mScreenState > ScreenStateHelper.SCREEN_STATE_ON_LOCKED)) {
+                                        mCookieUpToDate = -1;
                                         applyRouting(false);
                                     }
                                 }
@@ -4054,7 +4068,7 @@ public class NfcService implements DeviceHostListener {
                     Log.d(TAG, "MSG_APPLY_SCREEN_STATE " + mScreenState);
 
                     // Disable delay polling when screen state changed
-                    mPollingDelayed = false;
+                    mPollDelayed = false;
                     mHandler.removeMessages(MSG_DELAY_POLLING);
 
                     // If NFC is turning off, we shouldn't need any changes here
@@ -4117,10 +4131,10 @@ public class NfcService implements DeviceHostListener {
 
                 case MSG_DELAY_POLLING:
                   synchronized (NfcService.this) {
-                    if (!mPollingDelayed) {
+                    if (!mPollDelayed) {
                       return;
                     }
-                    mPollingDelayed = false;
+                    mPollDelayed = false;
                     mDeviceHost.startStopPolling(true);
                   }
                   if (DBG)
@@ -4580,8 +4594,11 @@ public class NfcService implements DeviceHostListener {
 
         private void dispatchTagEndpoint(TagEndpoint tagEndpoint, ReaderModeParams readerParams) {
             try {
+                /* Avoid setting mCookieUpToDate to negative values */
+                mCookieUpToDate = mCookieGenerator.nextLong() >>> 1;
                 Tag tag = new Tag(tagEndpoint.getUid(), tagEndpoint.getTechList(),
-                        tagEndpoint.getTechExtras(), tagEndpoint.getHandle(), mNfcTagService);
+                        tagEndpoint.getTechExtras(), tagEndpoint.getHandle(),
+                        mCookieUpToDate, mNfcTagService);
                 registerTagObject(tagEndpoint);
                 if (readerParams != null) {
                     try {
@@ -4612,13 +4629,14 @@ public class NfcService implements DeviceHostListener {
                 if (dispatchResult == NfcDispatcher.DISPATCH_FAIL && !mInProvisionMode) {
                     if (DBG) Log.d(TAG, "Tag dispatch failed");
                     unregisterObject(tagEndpoint.getHandle());
-                    if (mPollDelay > NO_POLL_DELAY) {
+                    if (mPollDelayTime > NO_POLL_DELAY) {
                         tagEndpoint.stopPresenceChecking();
                         mDeviceHost.startStopPolling(false);
-                        mPollingDelayed = true;
-                        if (DBG) Log.d(TAG, "Polling delayed");
+                        int delayTime = mPollDelayTime;
+                        mPollDelayed = true;
+                        if (DBG) Log.d(TAG, "Polling delayed" + delayTime);
                         mHandler.sendMessageDelayed(
-                                mHandler.obtainMessage(MSG_DELAY_POLLING), mPollDelay);
+                                mHandler.obtainMessage(MSG_DELAY_POLLING), delayTime);
                     } else {
                         Log.e(TAG, "Keep presence checking.");
                     }
@@ -4644,6 +4662,7 @@ public class NfcService implements DeviceHostListener {
                         if (DBG) Log.d(TAG, "Tag dispatch failed notification");
                     }
                 } else if (dispatchResult == NfcDispatcher.DISPATCH_SUCCESS) {
+                    mPollDelayCount = 0;
                     if (mScreenState == ScreenStateHelper.SCREEN_STATE_ON_UNLOCKED) {
                         mPowerManager.userActivity(SystemClock.uptimeMillis(),
                                 PowerManager.USER_ACTIVITY_EVENT_OTHER, 0);
@@ -4760,6 +4779,7 @@ public class NfcService implements DeviceHostListener {
                         ScreenStateHelper.SCREEN_STATE_OFF_LOCKED : ScreenStateHelper.SCREEN_STATE_OFF_UNLOCKED;
                      }
                 } else if (action.equals(Intent.ACTION_SCREEN_ON)) {
+                    mPollDelayCount = 0;
                     screenState = mKeyguard.isKeyguardLocked()
                             ? ScreenStateHelper.SCREEN_STATE_ON_LOCKED
                             : ScreenStateHelper.SCREEN_STATE_ON_UNLOCKED;
